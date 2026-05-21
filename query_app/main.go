@@ -18,6 +18,7 @@ var csvFiles = map[string]string{
 	"xiaomi":      "../mi_apps_full.csv",
 	"google_play": "../android_apps_with_perms.csv",
 	"taptap":      "../taptap_apps.csv",
+	"yyb":         "../yyb_apps.csv",
 }
 
 func main() {
