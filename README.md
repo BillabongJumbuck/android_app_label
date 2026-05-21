@@ -4,30 +4,47 @@
 
 ## 使用方式
 
+### 编译
+
 ```bash
-# 编译（可选交叉编译 Android ARM64）
-go build -o query_app .
-GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build -o query_app_arm64 .
+cd query_app
 
-# 放到手机上
-adb push query_app_arm64 /data/local/tmp/
-adb push *.csv /data/local/tmp/
-adb shell chmod 755 /data/local/tmp/query_app_arm64
+# 当前平台
+go build -buildvcs=false -o query_app .
 
-# 查询标签
-./query_app -l com.tencent.mm              # 仅输出标签
-./query_app com.tencent.mm                  # JSON 完整信息
-./query_app -l com.miui.securitymanager     # 冷门应用自动回退到 [OEM]
-./query_app -l com.github.kr328.clash       # 无匹配时回退到 [TF-IDF]
+# 交叉编译 Android ARM64
+GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build -buildvcs=false -o query_app_arm64 .
 ```
 
-**输出格式：**
-- 数据库命中 → 直接输出标签（多源用逗号分隔）
-- OEM 规则命中 → `[OEM] 系统/安全防护`
-- TF-IDF 推理 → `[TF-IDF] COMMUNICATION`
-- 无结果 → `(no result)`
+### 部署到手机
 
-**前置要求：** 首次运行会自动从 CSV 文件导入 SQLite 数据库。CSV 需放在二进制同目录下。
+CSV 文件和二进制放在同一目录，首次运行自动建库。
+
+```bash
+# 推送二进制和 CSV
+adb push query_app_arm64 /data/local/tmp/query_app
+adb push ../mi_apps_full.csv            /data/local/tmp/
+adb push ../android_apps_with_perms.csv /data/local/tmp/
+adb push ../taptap_apps.csv             /data/local/tmp/
+adb push ../yyb_apps.csv                /data/local/tmp/
+adb shell chmod 755 /data/local/tmp/query_app
+```
+
+### 查询
+
+```bash
+adb shell /data/local/tmp/query_app -l com.tencent.mm
+adb shell /data/local/tmp/query_app -l com.miui.securitymanager
+adb shell /data/local/tmp/query_app com.tencent.mm
+```
+
+**输出：**
+```
+COMMUNICATION,聊天社交/交友,社交/好友社交          # DB 命中，多源逗号分隔
+[OEM] OEM系统预装                                   # OEM 规则命中
+[TF-IDF] GAME_STRATEGY                              # TF-IDF 推理
+(no result)                                         # 无结果
+```
 
 ## 数据规模
 
@@ -43,7 +60,7 @@ adb shell chmod 755 /data/local/tmp/query_app_arm64
 
 ### 第一层：SQLite 数据库（覆盖 ~60%，可信度：高）
 
-四个数据源的 CSV 导入 SQLite，按 `package_name` 精确查询。同一个包名可能命中多个来源（如微信在小米、Google Play、应用宝都有），输出时逗号分隔。
+四个数据源的 CSV 导入 SQLite，按 `package_name` 精确查询。同一个包名可能命中多个来源，输出时逗号分隔。
 
 ### 第二层：OEM 硬规则（覆盖 ~25%，可信度：高）
 
@@ -55,11 +72,11 @@ adb shell chmod 755 /data/local/tmp/query_app_arm64
 
 ### 第三层：TF-IDF 推理（覆盖 ~10%，可信度：中）
 
-用 20,943 条已标注数据训练 char-bigram + jieba 分词的 TF-IDF 模型，通过余弦相似度找最相似的已标注应用，加权投票输出标签。预测结果带 `[TF-IDF]` 前缀以区别于确定性结果。
+用 20,943 条已标注数据训练 jieba + char-bigram 的 TF-IDF 模型，通过余弦相似度找最相似的已标注应用，加权投票输出标签。预测结果带 `[TF-IDF]` 前缀以区别于确定性结果。
 
-模型导出为四个文件嵌入 Go 二进制：`vocab.json`（1万词）、`idf.json`（权重）、`labels.json`（412 个标签）、`records.bin`（20,943 条训练向量，18MB）。
+模型嵌入 Go 二进制：`vocab.json`（1 万词）、`idf.json`（权重）、`labels.json`（412 个标签）、`records.bin`（20,943 条训练向量，18MB）。
 
-**局限性：** 基于字面相似度而非语义理解。短名字（"clash""mail"）和训练数据中无同类样本的应用容易出错。手机端推理耗时 2-3 秒（20,943 次稀疏向量余弦相似度）。
+**局限性：** 基于字面相似度而非语义理解。短名字和训练数据中无同类样本的应用容易出错。手机端推理耗时 2-3 秒。
 
 ### 兜不住（~5%）
 
@@ -76,19 +93,11 @@ adb shell chmod 755 /data/local/tmp/query_app_arm64
 
 ### 方向一：把 `[TF-IDF]` 前缀用起来
 
-目前 Go 二进制输出已带前缀标记。调用方可以根据前缀区别对待：
-
-- 无前缀 → 直接展示
-- `[OEM]` → 展示，标注"系统预装"
-- `[TF-IDF]` → 折叠展示，或附加置信度说明，或交给用户二次确认
-
-成本：零。就是把前缀当信号用，不改模型。
+Go 二进制已输出前缀标记。调用方可以根据前缀区别对待：无前缀直接展示，`[OEM]` 标注"系统预装"，`[TF-IDF]` 折叠展示或附加置信度说明。成本：零。
 
 ### 方向二：人工标注一批冷门应用
 
-TF-IDF 对"代理工具""金融安全组件""OEM 深度集成"这类应用表现差，因为训练数据里根本没有。如果有 200 条精确标注的电话端常见冷门应用，可以直接提升这一段的准确率，比改模型架构效果大得多。
-
-标注格式与现有 CSV 完全兼容，写入即可被 SQLite 层直接命中：
+TF-IDF 对训练数据里没有的应用类型（代理工具、金融安全组件等）表现差。标注 200 条电话端常见冷门应用可直接命中 SQLite 层，比改模型架构效果大得多。格式与现有 CSV 完全兼容：
 
 ```
 package_name,app_name,label,developer,permissions
@@ -98,33 +107,27 @@ com.unionpay.tsmservice,银联TSM服务,金融理财/安全组件,中国银联,<
 
 ### 方向三：传入真实应用名
 
-目前 CLI 查询只传包名，TF-IDF 从包名末段猜测应用名（`com.miui.securitymanager`→"securitymanager"）。如果能从手机的 `packages.xml` 或 launcher 数据库读取到真实应用名（"安全中心"），OEM 规则就能精准匹配，不需要 TF-IDF。
-
-实现方式：CLI 增加 `-n` 参数，或接受 `package_name|app_name` 格式输入。
+目前 CLI 只传包名，TF-IDF 从包名末段猜测应用名（`securitymanager` 而非 `安全中心`）。如果能从手机 `packages.xml` 或 launcher 数据库读到真实应用名，OEM 规则就能精准匹配，不需要 TF-IDF。实现方式：CLI 增加 `-n` 参数，或接受 `pkg|name` 格式输入。
 
 ## 项目结构
 
 ```
-├── mi_app_scraper.py          # 小米应用商店爬虫
-├── google_play.py              # Google Play 爬虫
-├── taptap_scraper.py           # TapTap 爬虫
-├── yyb_scraper.py              # 应用宝爬虫
-├── mi_apps_full.csv            # 小米数据（4,923 条）
-├── android_apps_with_perms.csv # Google Play 数据（9,177 条）
-├── taptap_apps.csv             # TapTap 数据（820 条）
-├── yyb_apps.csv                # 应用宝数据（9,110 条）
-├── tfidf_label/                # Python TF-IDF 训练 + 导出
-│   ├── predict_label.py        # CLI: train / predict / phone
-│   ├── oem_rules.py            # OEM 硬规则
-│   ├── export_for_go.py        # 导出模型为 Go embed 格式
-│   └── go_export/              # 导出文件
-├── query_app/                  # Go 查询工具
-│   ├── main.go                 # CLI + SQLite + 三层回退逻辑
-│   ├── tfidf/                  # TF-IDF 推理引擎
-│   │   ├── engine.go           # 模型加载 + 分词 + 余弦相似度
-│   │   ├── oem.go              # OEM 规则（Go 版）
-│   │   └── data/               # 嵌入的模型文件（18MB）
-│   ├── go.mod / go.sum
-│   └── query_app_arm64         # 编译好的 Android 二进制
-└── ANDROID_APP_LABELER.md      # 本文档
+├── mi_app_scraper.py              # 小米应用商店爬虫
+├── google_play.py                  # Google Play 爬虫
+├── taptap_scraper.py               # TapTap 爬虫
+├── yyb_scraper.py                  # 应用宝爬虫
+├── *.csv                           # 四个数据源 CSV
+├── tfidf_label/                    # Python TF-IDF 训练 + 导出
+│   ├── predict_label.py            # CLI: train / predict / phone
+│   ├── oem_rules.py                # OEM 硬规则
+│   ├── export_for_go.py            # 导出模型为 Go embed 格式
+│   └── go_export/                  # 导出文件
+├── query_app/                      # Go 查询工具
+│   ├── main.go                     # CLI + SQLite + 三层回退逻辑
+│   ├── tfidf/                      # TF-IDF 推理引擎
+│   │   ├── engine.go               # 模型加载 + 分词 + 余弦相似度
+│   │   ├── oem.go                  # OEM 规则（Go 版）
+│   │   └── data/                   # 嵌入的模型文件（18MB）
+│   └── go.mod
+└── ANDROID_APP_LABELER.md          # 本文档
 ```
