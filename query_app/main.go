@@ -8,17 +8,35 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 
 	_ "modernc.org/sqlite"
+	"query_app/tfidf"
 )
 
 const dbFile = "apps.db"
 
+var (
+	tfidfModel     *tfidf.Model
+	tfidfModelOnce sync.Once
+)
+
+func getModel() *tfidf.Model {
+	tfidfModelOnce.Do(func() {
+		var err error
+		tfidfModel, err = tfidf.LoadModel()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "TF-IDF model load failed: %v (predictions disabled)\n", err)
+		}
+	})
+	return tfidfModel
+}
+
 var csvFiles = map[string]string{
-	"xiaomi":      "../mi_apps_full.csv",
-	"google_play": "../android_apps_with_perms.csv",
-	"taptap":      "../taptap_apps.csv",
-	"yyb":         "../yyb_apps.csv",
+	"xiaomi":      "./mi_apps_full.csv",
+	"google_play": "./android_apps_with_perms.csv",
+	"taptap":      "./taptap_apps.csv",
+	"yyb":         "./yyb_apps.csv",
 }
 
 func main() {
@@ -194,7 +212,7 @@ func query(db *sql.DB, pkg string, labelOnly bool) {
 
 	if labelOnly {
 		if len(results) == 0 {
-			fmt.Println("(no result)")
+fmt.Println(predictLabel(pkg, ""))
 			return
 		}
 		var labels []string
@@ -208,11 +226,54 @@ func query(db *sql.DB, pkg string, labelOnly bool) {
 	}
 
 	if len(results) == 0 {
-		fmt.Println("(no result)"); return
+		predicted := predictLabel(pkg, "")
+		fmt.Println(predicted)
+		return
 	}
 
 	out, _ := json.MarshalIndent(results, "", "  ")
 	fmt.Println(string(out))
+}
+
+var genericSegments = map[string]bool{
+	"android": true, "mobile": true, "app": true, "ui": true,
+	"community": true, "service": true, "services": true,
+	"application": true, "client": true, "platform": true,
+	"com": true, "cn": true, "org": true, "net": true, "io": true,
+}
+
+func inferName(pkg string) string {
+	parts := strings.Split(pkg, ".")
+	// Walk backwards, skip generic segments
+	for i := len(parts) - 1; i >= 0; i-- {
+		if !genericSegments[parts[i]] {
+			return parts[i]
+		}
+	}
+	return parts[len(parts)-1]
+}
+
+func predictLabel(pkg, appName string) string {
+	// Infer name from package if not provided
+	if appName == "" {
+		appName = inferName(pkg)
+	}
+
+	// 1. OEM rules
+	if label, ok := tfidf.MatchOEM(appName, pkg); ok {
+		return "[OEM] " + label
+	}
+
+	// 2. TF-IDF model
+	m := getModel()
+	if m == nil {
+		return "(no result)"
+	}
+	label := m.BestLabel(appName, "")
+	if label == "unknown" || label == "" {
+		return "(no result)"
+	}
+	return "[TF-IDF] " + label
 }
 
 func fatalf(format string, args ...any) {
